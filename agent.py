@@ -100,6 +100,10 @@ def post_review_to_github(pr_number: int, comment: str) -> str:
 
     try:
         pull_request = repo.get_pull(pr_number)
+        # Delete any existing pending reviews to avoid 422 (one pending review per user limit)
+        for review in pull_request.get_reviews():
+            if review.state == "PENDING":
+                review.delete()
         pull_request.create_review(body=comment, event="COMMENT")
         return f"Review successfully posted to PR #{pr_number}."
     except Exception as e:
