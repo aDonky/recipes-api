@@ -1,0 +1,3 @@
+# What I Learned — PR Review Agent
+
+Honestly this one was trickier than I expected. The multi-agent handoff stuff with LlamaIndex clicked pretty quickly, but the GitHub Actions bit had a few gotchas that weren't obvious at all — like the fact that `create_review()` without an event parameter just silently saves a draft that nobody can see. That cost a lot of time. Also learning that PyGitHub has that one-pending-review-per-user limit was one of those things you'd never know until you hit the 422. Overall though, building something that actually runs in CI and posts a real review on a real PR felt pretty satisfying once it all came together.
