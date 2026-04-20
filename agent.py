@@ -18,15 +18,16 @@ from llama_index.llms.openai import OpenAI
 
 dotenv.load_dotenv()
 
-# --- GitHub & repo setup ---
+# hook up to github — token comes from env (or GitHub Actions secrets)
 git = Github(os.getenv("GITHUB_TOKEN")) if os.getenv("GITHUB_TOKEN") else None
 
-repository = os.getenv("REPOSITORY")          # e.g. "aDonky/recipes-api"
-pr_number = int(os.getenv("PR_NUMBER", "0"))  # PR number passed by GitHub Actions
+# these get injected by GitHub Actions as env vars
+repository = os.getenv("REPOSITORY")           # e.g. "aDonky/recipes-api"
+pr_number = int(os.getenv("PR_NUMBER", "0"))   # which PR we're reviewing
 
 repo = git.get_repo(repository) if git is not None and repository else None
 
-# --- LLM setup ---
+# set up the LLM — reads model/key/base_url from env
 llm = OpenAI(
     model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
     api_key=os.getenv("OPENAI_API_KEY"),
@@ -34,7 +35,7 @@ llm = OpenAI(
 )
 
 
-# --- GitHub tool functions ---
+# --- github helper functions ---
 
 def get_pr_details(pr_number: int) -> dict:
     """Fetch details of a pull request given its number. Returns the author, title,
@@ -44,10 +45,10 @@ def get_pr_details(pr_number: int) -> dict:
 
     pull_request = repo.get_pull(pr_number)
 
-    commit_SHAs = []
-    commits = pull_request.get_commits()
-    for c in commits:
-        commit_SHAs.append(c.sha)
+    # grab the sha for each commit on this PR
+    commit_hashes = []
+    for c in pull_request.get_commits():
+        commit_hashes.append(c.sha)
 
     return {
         "user": pull_request.user.login,
@@ -56,7 +57,7 @@ def get_pr_details(pr_number: int) -> dict:
         "diff_url": pull_request.diff_url,
         "state": pull_request.state,
         "head_sha": pull_request.head.sha,
-        "commit_SHAs": commit_SHAs,
+        "commit_SHAs": commit_hashes,
     }
 
 
@@ -100,49 +101,52 @@ def post_review_to_github(pr_number: int, comment: str) -> str:
 
     try:
         pull_request = repo.get_pull(pr_number)
-        # Delete any existing pending reviews to avoid 422 (one pending review per user limit)
-        for review in pull_request.get_reviews():
-            if review.state == "PENDING":
-                review.delete()
+
+        # GitHub only allows one pending review per user — clean those up first
+        for existing_review in pull_request.get_reviews():
+            if existing_review.state == "PENDING":
+                existing_review.delete()
+
+        # post as a submitted comment, not a draft
         pull_request.create_review(body=comment, event="COMMENT")
         return f"Review successfully posted to PR #{pr_number}."
     except Exception as e:
         return f"Error posting review to PR #{pr_number}: {e}"
 
 
-# --- State management functions ---
+# --- shared state helpers (async because the workflow context requires it) ---
 
 async def add_context_to_state(ctx: Context, context: str) -> str:
     """Useful for saving the gathered context summary to the shared workflow state."""
-    current_state = await ctx.store.get("state", default={})
-    current_state["gathered_contexts"] = context
-    await ctx.store.set("state", current_state)
+    state = await ctx.store.get("state", default={})
+    state["gathered_contexts"] = context
+    await ctx.store.set("state", state)
     return "State updated with gathered contexts."
 
 
 async def add_comment_to_state(ctx: Context, draft_comment: str) -> str:
     """Useful for saving the drafted PR review comment to the shared workflow state."""
-    current_state = await ctx.store.get("state", default={})
-    current_state["review_comment"] = draft_comment
-    await ctx.store.set("state", current_state)
+    state = await ctx.store.get("state", default={})
+    state["review_comment"] = draft_comment
+    await ctx.store.set("state", state)
     return "State updated with draft comment."
 
 
 async def add_final_review_to_state(ctx: Context, final_review: str) -> str:
     """Useful for saving the final reviewed PR comment to the shared workflow state."""
-    current_state = await ctx.store.get("state", default={})
-    current_state["final_review"] = final_review
-    await ctx.store.set("state", current_state)
+    state = await ctx.store.get("state", default={})
+    state["final_review"] = final_review
+    await ctx.store.set("state", state)
     return "State updated with final review."
 
 
-# --- Convert GitHub functions to tools ---
+# --- wrap the github functions as LlamaIndex tools ---
 pr_details_tool = FunctionTool.from_defaults(get_pr_details)
 file_contents_tool = FunctionTool.from_defaults(get_file_contents)
 commit_details_tool = FunctionTool.from_defaults(get_commit_details)
 post_review_tool = FunctionTool.from_defaults(post_review_to_github)
 
-# --- ContextAgent ---
+# --- ContextAgent: fetches everything we need from the repo ---
 context_agent = FunctionAgent(
     llm=llm,
     name="ContextAgent",
@@ -158,7 +162,7 @@ context_agent = FunctionAgent(
     can_handoff_to=["CommentorAgent"],
 )
 
-# --- CommentorAgent ---
+# --- CommentorAgent: takes the context and writes the actual review ---
 commentor_agent = FunctionAgent(
     llm=llm,
     name="CommentorAgent",
@@ -186,7 +190,7 @@ commentor_agent = FunctionAgent(
     can_handoff_to=["ContextAgent", "ReviewAndPostingAgent"],
 )
 
-# --- ReviewAndPostingAgent ---
+# --- ReviewAndPostingAgent: checks the draft is good then posts it ---
 review_and_posting_agent = FunctionAgent(
     llm=llm,
     name="ReviewAndPostingAgent",
@@ -211,7 +215,7 @@ review_and_posting_agent = FunctionAgent(
     can_handoff_to=["CommentorAgent"],
 )
 
-# --- AgentWorkflow ---
+# --- wire the three agents together ---
 workflow_agent = AgentWorkflow(
     agents=[context_agent, commentor_agent, review_and_posting_agent],
     root_agent=review_and_posting_agent.name,
@@ -223,7 +227,7 @@ workflow_agent = AgentWorkflow(
 )
 
 
-# --- Async main (no input — uses env vars from GitHub Actions) ---
+# --- main: no stdin — everything comes from env vars set by GitHub Actions ---
 async def main():
     query = f"Write a review for PR number {pr_number}"
     prompt = RichPromptTemplate(query)
